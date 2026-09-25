@@ -1,0 +1,538 @@
+---
+title: "PDR merged: raw timecourse bootstrap + manuscript-consistent rest (documented)"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+# Setting
+```{r setup, include=FALSE}
+# 目的：全局 knit 选项、装包、配色与时程关键参数。
+# 参数：fig 尺寸/dpi；sampling_rate=250Hz；baseline_points=50（去 -0.2~0s 基线）。
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, dpi = 150)
+pkgs <- c("readxl", "dplyr", "tidyr", "ggplot2", "lme4", "lmerTest",
+          "emmeans", "knitr", "patchwork", "boot", "purrr", "cowplot")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+# 显式绑定，避免被其他包的同名函数覆盖。
+select <- dplyr::select; filter <- dplyr::filter; mutate <- dplyr::mutate
+summarise <- dplyr::summarise; arrange <- dplyr::arrange
+group_by <- dplyr::group_by; rename <- dplyr::rename
+tab_file <- "02_PDR_INPUT.xlsx"  # 输入：T1_50/T2_both_48/T2_1block_48/Adult_39
+raw_dir <- "Data"                # 输入：timecourse_children_T1/T2/adults.xlsx
+# mean_sd(x): 输入数值向量；输出 "均值 ± SD" 字符串（两位小数）。
+mean_sd <- function(x) paste0(round(mean(x, na.rm = TRUE), 2), " ± ",
+                              round(sd(x, na.rm = TRUE), 2))
+cond_colors <- c(standard = "#9DB8A0", noise = "#2980B9", laughter = "#E8849A")
+cond_labels <- c(standard = "Standard", noise = "Noise", laughter = "Laughter")
+sig_bar_colors <- c("standard - noise" = "#7A5195",
+                    "standard - laughter" = "#EF5675",
+                    "noise - laughter" = "#FFA600")
+tc_y_limits <- c(-0.30, 0.26); sampling_rate <- 250; baseline_points <- 50
+set.seed(20260924)  # bootstrap 随机种子，保证可重复。
+col_cond <- cond_colors; lab_cond <- cond_labels; col_sig <- sig_bar_colors
+col_group <- c(Child_T1 = "#F5C86E", Child_T2 = "#D4882A", Adult = "#7D3C98")
+col_time <- c(T1 = "#F5C86E", T2 = "#D4882A")
+```
+
+```{r load_tab}
+# 目的：读 INPUT 四个 sheet，算纵向交集 id，给 T2b 补基线 age/income（按 ID join）。
+# 输入：tab_file；输出：T1/T2b/T2_first/AD/long_ids（T1∩T2 的 39 人）。
+T1 <- read_xlsx(tab_file, sheet = "T1_50")
+T2b <- read_xlsx(tab_file, sheet = "T2_both_48")
+T2_first <- read_xlsx(tab_file, sheet = "T2_1block_48")
+AD <- read_xlsx(tab_file, sheet = "Adult_39")
+long_ids <- intersect(T1$subjectid, T2b$subjectid)
+T2b <- T2b %>% left_join(T1 %>% select(subjectid, Age, family_income),
+                         by = "subjectid")
+```
+
+# 1 Sample characteristics (demographics)
+
+```{r demographics}
+# 目的：人口学单独描述（Table 1 的 N/年龄/性别/rest），不做模型。
+# 输入：T1/T2b/T2_first/AD；输出：Table 1 四列 + T2vsAdult 性别 Fisher 检验。
+kable(data.frame(
+  Group = c("Child T1 (N=50)", "Child T2 1-block (N=48)",
+            "Child T2 both (N=48)", "Adult (N=39)"),
+  N_MF = c("20/30", "24/24", "24/24", "14/25"),
+  Age = c(mean_sd(T1$Age / 12), mean_sd(T2_first$Age_T2 / 12),
+          mean_sd(T2b$Age_T2 / 12), mean_sd(AD$age_img)),
+  Rest = c(mean_sd(T1$Rest_T1), mean_sd(T2b$Rest_T2),  # 暂用 both 值代替 1-block
+           mean_sd(T2b$Rest_T2), mean_sd(AD$RestMeanPupilSize))
+), caption = "Table 1: sample characteristics (T2 1-block rest pending block-specific preprocessing)")
+print(fisher.test(table(
+  factor(c(T2b$Sex, ifelse(AD$sex_img == "男", 1, 2)), levels = 1:2),
+  factor(c(rep("T2", nrow(T2b)), rep("Adult", nrow(AD)))))))
+```
+
+# 2 Tonic pupil diameter (LMM)
+
+```{r tonic}
+# 目的：tonic LMM：tonic ~ Group + age_c + sex + (1|subject)。
+# 年龄中心化：儿童减 T1 均值，成人减成人均值。输出 anova/summary。
+tonic <- bind_rows(
+  T1 %>% transmute(subject = subjectid, Group = "T1",
+                   tonic = Rest_T1, age = Age / 12,
+                   sex = ifelse(Sex == 1, "Male", "Female")),
+  T2b %>% transmute(subject = subjectid, Group = "T2",
+                    tonic = Rest_T2, age = Age_T2 / 12,
+                    sex = ifelse(Sex == 1, "Male", "Female")),
+  AD %>% transmute(subject = SubjectID, Group = "Adult",
+                   tonic = RestMeanPupilSize, age = age_img,
+                   sex = ifelse(sex_img == "男", "Male", "Female"))
+) %>%
+  mutate(Group = factor(Group, levels = c("T1", "T2", "Adult")),
+         sex = factor(sex), subject = factor(subject))
+tonic$age_c <- with(tonic, ifelse(Group == "Adult",
+  age - mean(age[Group == "Adult"], na.rm = TRUE),
+  age - mean(age[Group == "T1"], na.rm = TRUE)))
+fit_tonic <- lmer(tonic ~ Group + age_c + sex + (1 | subject), data = tonic)
+print(anova(fit_tonic, type = 3)); print(summary(fit_tonic))
+```
+
+# 3 Timecourse from raw data
+
+## 3.1 Build unified source table
+
+```{r build_source}
+# 目的：把三个原时程 xlsx 拼成一张长表 raw_long。
+# read_one_stage(path, stage_id, time_col)：读一本书 3 个 sheet，转长表并去掉
+#   前 baseline_points=50 个点；params 见名；returns 该 stage 的长表。
+# 输出：raw_long(stage,condition,time_sec,time_point,subject,y) + 审计 + tc_mean。
+read_one_stage <- function(path, stage_id, time_col) {
+  conds <- c("standard", "noise", "laughter")
+  parts <- lapply(conds, function(cd) {
+    d <- read_xlsx(path, sheet = cd)
+    names(d)[names(d) == time_col] <- "time_sec"
+    d %>% mutate(time_point = row_number()) %>%
+      filter(time_point > baseline_points) %>% # 定义见Setting Chunk
+      pivot_longer(cols = -c(time_sec, time_point),
+                   names_to = "subject", values_to = "y") %>%
+      mutate(stage = stage_id, condition = cd)
+  })
+  bind_rows(parts)
+}
+raw_long <- bind_rows(
+  read_one_stage(file.path(raw_dir, "timecourse_children_T1.xlsx"), "Child_T1", "Time (s)"),
+  read_one_stage(file.path(raw_dir, "timecourse_children_T2.xlsx"), "Child_T2", "Time_s"),
+  read_one_stage(file.path(raw_dir, "timecourse_adults.xlsx"), "Adult", "Time_s")
+) %>%
+  mutate(stage = factor(stage, levels = c("Child_T1", "Child_T2", "Adult")),
+         condition = factor(condition, levels = c("standard", "noise", "laughter")),
+         subject = factor(subject))
+print(raw_long %>% group_by(stage, condition) %>%
+        summarise(n_sub = n_distinct(subject), n_time = n_distinct(time_sec),
+                  .groups = "drop"))
+tc_mean <- raw_long %>%
+  group_by(stage, condition, time_sec) %>%
+  summarise(mean_pupil = mean(y, na.rm = TRUE),
+            se = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+```
+
+## 3.2 Pointwise bootstrap BCa + blocks
+
+```{r bootstrap, cache=TRUE}
+# 目的：逐时间点配对 bootstrap BCa(R=1000) + >=5 连续点成块）。
+# compute_timecourse_stats(df_long)：输入单 stage 长表；输出 mean_timecourse/
+#   time_results（含 CI 与 significant)/sig_blocks（含 x_start/x_end/y)。
+compute_timecourse_stats <- function(df_long) {
+  mean_timecourse <- df_long %>%
+    group_by(condition, time_point, time_sec) %>%
+    summarise(mean_pupil = mean(y, na.rm = TRUE),
+              se = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+  comparisons <- combn(c("standard", "noise", "laughter"), 2, simplify = FALSE)
+  time_results <- purrr::map_dfr(comparisons, function(pair) {
+    cond1 <- pair[1]; cond2 <- pair[2]
+    purrr::map_dfr(sort(unique(df_long$time_point)), function(t) {
+      tmp <- df_long %>% filter(time_point == t, condition %in% pair) %>%
+        pivot_wider(names_from = condition, values_from = y)
+      diff_val <- mean(tmp[[cond1]] - tmp[[cond2]], na.rm = TRUE)
+      ci_lower <- NA; ci_upper <- NA; significant <- FALSE
+      if (nrow(tmp) > 1) {
+        boot_fn <- function(data, indices) {
+          d <- data[indices, ]
+          mean(d[[cond1]] - d[[cond2]], na.rm = TRUE)
+        }
+        boot_res <- boot::boot(tmp, boot_fn, R = 1000)
+        ci <- tryCatch(boot::boot.ci(boot_res, type = "bca"),
+                       error = function(e) NULL)
+        if (!is.null(ci) && !is.null(ci$bca)) {
+          ci_lower <- ci$bca[4]; ci_upper <- ci$bca[5]
+          significant <- ci_lower > 0 | ci_upper < 0
+        }
+      }
+      data.frame(time_point = t, time_sec = unique(tmp$time_sec),
+                 comparison = paste(cond1, "-", cond2),
+                 diff = diff_val, ci_lower = ci_lower, ci_upper = ci_upper,
+                 significant = significant, stringsAsFactors = FALSE)
+    })
+  })
+  gap_threshold <- (1 / sampling_rate) * 1.5
+  sig_blocks <- time_results %>% filter(significant == TRUE) %>%
+    arrange(comparison, time_sec) %>% group_by(comparison) %>%
+    mutate(time_gap = c(0, diff(time_sec)),
+           new_block = time_gap > gap_threshold,
+           block_id = cumsum(new_block) + 1) %>%
+    group_by(comparison, block_id) %>%
+    mutate(block_n_points = n()) %>% filter(block_n_points >= 5) %>%
+    summarise(x_start = min(time_sec), x_end = max(time_sec),
+              n_points = n(), .groups = "drop") %>% select(-block_id)
+  y_map <- data.frame(comparison = c("standard - noise", "standard - laughter",
+                                     "noise - laughter"),
+                      y = c(-0.22, -0.245, -0.27))
+  sig_blocks <- sig_blocks %>% left_join(y_map, by = "comparison")
+  list(mean_timecourse = mean_timecourse, time_results = time_results,
+       sig_blocks = sig_blocks)
+}
+res_T1 <- compute_timecourse_stats(raw_long %>% filter(stage == "Child_T1"))
+res_T2 <- compute_timecourse_stats(raw_long %>% filter(stage == "Child_T2"))
+res_AD <- compute_timecourse_stats(raw_long %>% filter(stage == "Adult"))
+print(res_T1$sig_blocks); print(res_T2$sig_blocks); print(res_AD$sig_blocks)
+```
+
+## 3.3 Figure 1A-C
+
+```{r fig1abc, fig.show='hold', out.width='100%'}
+# 目的：画 Figure 1A-C（均值±SE + 显著条带）。
+# plot_timecourse_with_sig(mean_timecourse, sig_blocks)：输入该 stage 的均值表
+#   与显著块表；输出 ggplot（ylim 统一 tc_y_limits）。
+plot_timecourse_with_sig <- function(mean_timecourse, sig_blocks) {
+  all_colors <- c(cond_colors, sig_bar_colors)
+  p <- ggplot() +
+    geom_line(data = mean_timecourse,
+              aes(x = time_sec, y = mean_pupil, color = condition), linewidth = 1.6) +
+    geom_ribbon(data = mean_timecourse,
+                aes(x = time_sec, ymin = mean_pupil - se, ymax = mean_pupil + se,
+                    fill = condition), alpha = 0.3) +
+    scale_fill_manual(values = cond_colors, guide = "none") +
+    scale_x_continuous(breaks = c(-0.2, 0, 0.5, 1, 1.5, 2, 2.5)) +
+    labs(x = NULL, y = NULL) + theme_classic(base_size = 16) +
+    theme(axis.line = element_line(linewidth = 1.2, colour = "black"),
+          legend.position = "none",
+          axis.text = element_text(face = "bold")) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8)
+  if (nrow(sig_blocks) > 0) {
+    p <- p + geom_segment(data = sig_blocks,
+      aes(x = x_start, xend = x_end, y = y, yend = y, color = comparison),
+      linewidth = 4, alpha = 0.9, inherit.aes = FALSE, show.legend = FALSE)
+  }
+  p + coord_cartesian(ylim = tc_y_limits) +
+    scale_color_manual(name = NULL, values = all_colors,
+                       breaks = names(cond_colors), labels = cond_labels, guide = "none")
+}
+pA <- plot_timecourse_with_sig(res_T1$mean_timecourse, res_T1$sig_blocks)
+pB <- plot_timecourse_with_sig(res_T2$mean_timecourse, res_T2$sig_blocks)
+pC <- plot_timecourse_with_sig(res_AD$mean_timecourse, res_AD$sig_blocks)
+print(pA); print(pB); print(pC)
+fig_tc <- (pA | pB | pC) + plot_annotation(tag_levels = "A") +
+  plot_layout(guides = "collect") & theme(legend.position = "right")
+print(fig_tc)
+```
+
+# 4 Table 2 (mean PDR and latency)
+
+```{r table2}
+# 目的：Table 2（amplitude/latency 的 mean ± SD），三组 × 条件。
+# 输入：T1/T2b/AD；输出：tab2 打印。
+ms2 <- function(x) sprintf("%.2f ± %.2f", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+tab2 <- data.frame(
+  Metric = c("Mean PDR amplitude (mm)", "Standard", "Noise", "Laughter",
+             "PDR peak latency (s)", "Noise", "Laughter"),
+  `Children (T1)` = c("", ms2(T1$standard_mean_T1), ms2(T1$noise_mean_T1),
+    ms2(T1$laughter_mean_T1), "", ms2(T1$noise_peak_latency_T1),
+    ms2(T1$laughter_peak_latency_T1)),
+  `Children (T2)` = c("", ms2(T2b$standard_mean_T2), ms2(T2b$noise_mean_T2),
+    ms2(T2b$laughter_mean_T2), "", ms2(T2b$noise_peak_latency_T2),
+    ms2(T2b$laughter_peak_latency_T2)),
+  Adults = c("", ms2(AD$standard_mean_1_2s), ms2(AD$noise_mean_1_2s),
+    ms2(AD$laughter_mean_1_2s), "", ms2(AD$noise_latency), ms2(AD$laughter_latency)),
+  check.names = FALSE)
+kable(tab2, caption = "Table 2", align = c("l", "c", "c", "c"))
+```
+
+# 5 Within-stage LMMs
+
+```{r within}
+# 目的：within-stage LMM（儿童 +age/sex/income；成人 +age/sex），omnibus 显著才 Tukey。
+# make_long_cov()：把三组拼成 amp/lat 长表；fit_within(data, stage_id, metric)：
+#   组内中心 age_c，listwise 删缺失，跑 lmer 并打印 N/anova/对比。
+make_long_cov <- function() {
+  amp <- bind_rows(
+    T1 %>% transmute(subject = subjectid, stage = "Child_T1", age = Age / 12,
+      sex = ifelse(Sex == 1, "Male", "Female"), income = family_income,
+      standard = standard_mean_T1, noise = noise_mean_T1, laughter = laughter_mean_T1),
+    T2b %>% transmute(subject = subjectid, stage = "Child_T2", age = Age / 12,
+      sex = ifelse(Sex == 1, "Male", "Female"), income = family_income,
+      standard = standard_mean_T2, noise = noise_mean_T2, laughter = laughter_mean_T2),
+    AD %>% transmute(subject = SubjectID, stage = "Adult", age = age_img,
+      sex = ifelse(sex_img == "男", "Male", "Female"), income = NA_real_,
+      standard = standard_mean_1_2s, noise = noise_mean_1_2s, laughter = laughter_mean_1_2s)) %>%
+    pivot_longer(c(standard, noise, laughter), names_to = "condition", values_to = "y")
+  lat <- bind_rows(
+    T1 %>% transmute(subject = subjectid, stage = "Child_T1", age = Age / 12,
+      sex = ifelse(Sex == 1, "Male", "Female"), income = family_income,
+      noise = noise_peak_latency_T1, laughter = laughter_peak_latency_T1),
+    T2b %>% transmute(subject = subjectid, stage = "Child_T2", age = Age / 12,
+      sex = ifelse(Sex == 1, "Male", "Female"), income = family_income,
+      noise = noise_peak_latency_T2, laughter = laughter_peak_latency_T2),
+    AD %>% transmute(subject = SubjectID, stage = "Adult", age = age_img,
+      sex = ifelse(sex_img == "男", "Male", "Female"), income = NA_real_,
+      noise = noise_latency, laughter = laughter_latency)) %>%
+    pivot_longer(c(noise, laughter), names_to = "condition", values_to = "y")
+  list(amp = amp, lat = lat)
+}
+dat <- make_long_cov()
+# fit_within(data, stage_id, metric)：输入单指标长表+stage名；输出打印 N/anova/Tukey
+fit_within <- function(data, stage_id, metric) {
+  # 1. 取该 stage，因子化，年龄组内去均值
+  d <- data %>% filter(stage == stage_id) %>%
+    mutate(subject = factor(subject), sex = factor(sex),
+           condition = factor(condition), age_c = age - mean(age, na.rm = TRUE))
+  # 2. listwise 删缺失（儿童另删 income 缺失）
+  d <- d[complete.cases(d$y, d$condition, d$subject, d$age_c, d$sex,
+                        if (stage_id != "Adult") d$income), ]
+  # 3. 公式：儿童多 income 协变量，subject 随机截距
+  form <- if (stage_id == "Adult") y ~ condition + age_c + sex + (1 | subject)
+          else y ~ condition + age_c + sex + income + (1 | subject)
+  # 4. 拟合 + 三型 anova
+  fit <- lmer(form, data = d)
+  a <- as.data.frame(anova(fit, type = 3))
+  cat("\n###", metric, stage_id, "N =", n_distinct(d$subject), "\n"); print(a)
+  # 5. omnibus 显著才 Tukey，避免多重比较滥用
+  p <- a["condition", "Pr(>F)"]
+  if (!is.na(p) && p < 0.05) print(emmeans(fit, pairwise ~ condition, adjust = "tukey")$contrasts)
+  invisible(fit)
+}
+for (s in c("Child_T1", "Child_T2", "Adult")) fit_within(dat$amp, s, "amplitude")
+for (s in c("Child_T1", "Child_T2", "Adult")) fit_within(dat$lat, s, "latency")
+```
+
+## 5.1 Figure 1D/F
+
+```{r within_plots, fig.show='hold', out.width='49%'}
+# 目的：Figure 1D(amplitude, x=stage) 与 1F(latency)，均值±SE + 显著括号。
+summ_amp <- dat$amp %>%
+  mutate(stage = factor(stage, levels = c("Child_T1", "Child_T2", "Adult")),
+         condition = factor(condition, levels = c("standard", "noise", "laughter"))) %>%
+  group_by(stage, condition) %>%
+  summarise(M = mean(y, na.rm = TRUE),
+            SE = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+p_amp <- ggplot(summ_amp, aes(stage, M, fill = condition)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = M - SE, ymax = M + SE),
+                position = position_dodge(0.8), width = 0.2, linewidth = 0.5) +
+  scale_fill_manual(values = col_cond, labels = lab_cond) +
+  scale_x_discrete(labels = c("Children (T1)", "Children (T2)", "Adults")) +
+  coord_cartesian(ylim = c(0, 0.26)) +
+  labs(x = NULL, y = "Stimulus-evoked mean PDR amplitude (mm)") +
+  theme_classic(base_size = 12)
+bracket_y <- c(0.225, 0.175, 0.115)
+for (i in 1:3) {
+  p_amp <- p_amp +
+    annotate("segment", x = i - 0.27, xend = i + 0.27,
+             y = bracket_y[i], yend = bracket_y[i], linewidth = 0.4) +
+    annotate("text", x = i, y = bracket_y[i] + 0.012, label = "p < .001", size = 3.5)
+}
+print(p_amp)
+summ_lat <- dat$lat %>%
+  mutate(stage = factor(stage, levels = c("Child_T1", "Child_T2", "Adult")),
+         condition = factor(condition, levels = c("noise", "laughter"))) %>%
+  group_by(stage, condition) %>%
+  summarise(M = mean(y, na.rm = TRUE),
+            SE = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+p_lat <- ggplot(summ_lat, aes(stage, M, fill = condition)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = M - SE, ymax = M + SE),
+                position = position_dodge(0.8), width = 0.2, linewidth = 0.5) +
+  scale_fill_manual(values = col_cond[c("noise", "laughter")]) +
+  scale_x_discrete(labels = c("Children (T1)", "Children (T2)", "Adults")) +
+  coord_cartesian(ylim = c(1.4, 1.9)) +
+  labs(x = NULL, y = "PDR peak latency (s)") + theme_classic(base_size = 12)
+bracket_y_lat <- c(1.78, 1.70, 1.82)
+for (i in 1:3) {
+  p_lat <- p_lat +
+    annotate("segment", x = i - 0.2, xend = i + 0.2,
+             y = bracket_y_lat[i], yend = bracket_y_lat[i], linewidth = 0.4) +
+    annotate("text", x = i, y = bracket_y_lat[i] + 0.03, label = "n.s.", size = 3.5)
+}
+print(p_lat)
+```
+
+# 6 Developmental trend (laughter-minus-noise)
+
+```{r trend}
+# 目的：laughter-noise 差分 + 有序 stage 线性趋势（LMM + contr.poly）。
+# 输入：T1/T2b/AD；输出：anova/summary（stage.L 即线性趋势 t(124.73)=3.09）。
+# 1. 三组拼差分表：diff = laughter - noise；stage 定为有序因子
+trend <- bind_rows(
+  T1 %>% transmute(subject = subjectid, sex = ifelse(Sex == 1, "Male", "Female"),
+                   diff = laughter_mean_T1 - noise_mean_T1, stage = "Child_T1"),
+  T2b %>% transmute(subject = subjectid, sex = ifelse(Sex == 1, "Male", "Female"),
+                    diff = laughter_mean_T2 - noise_mean_T2, stage = "Child_T2"),
+  AD %>% transmute(subject = SubjectID, sex = ifelse(sex_img == "男", "Male", "Female"),
+                   diff = laughter_mean_1_2s - noise_mean_1_2s, stage = "Adult")) %>%
+  mutate(subject = factor(subject), sex = factor(sex),
+         stage = factor(stage, levels = c("Child_T1", "Child_T2", "Adult"), ordered = TRUE))
+# 2. LMM：stage 有序 + sex，subject 随机截距；stage.L 即线性趋势
+fitTrend <- lmer(diff ~ stage + sex + (1 | subject), data = trend,
+                 contrasts = list(stage = "contr.poly"))
+print(anova(fitTrend, type = 3)); print(summary(fitTrend))
+```
+
+## 6.1 Figure 1E
+
+```{r trend_plot, fig.show='hold'}
+# 目的：Figure 1E（violin + 均值点线）。输入 trend；输出 p_trend。
+p_trend <- ggplot(trend, aes(stage, diff, fill = stage)) +
+  geom_violin(alpha = 0.3, color = NA) +
+  geom_jitter(width = 0.12, size = 1.2, alpha = 0.6) +
+  stat_summary(fun = mean, geom = "point", shape = 21, fill = "white", size = 3) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "black") +
+  scale_fill_manual(values = col_group) +
+  labs(x = NULL, y = "Laughter - Noise (mm)") +
+  theme_classic(base_size = 12) + theme(legend.position = "none")
+print(p_trend)
+```
+
+# 7 Longitudinal change (T1 vs T2)
+
+```{r long}
+# 目的：纵向 T1vsT2（仅 first block，n=39）：y ~ Time*condition + age_T1 + sex + income。
+# T2 年龄用 T1 基线 age（join），age_T1 去均值。输出 anova。
+longP <- bind_rows(
+  T1 %>% filter(subjectid %in% long_ids) %>%
+    transmute(subject = subjectid, Time = "T1", age_T1 = Age / 12,
+              sex = ifelse(Sex == 1, "Male", "Female"), income = family_income,
+              standard = standard_mean_T1, noise = noise_mean_T1, laughter = laughter_mean_T1),
+  # T2 只用 first block；基线 age 从 T1 按 ID 回填
+  T2_first %>% filter(subjid %in% long_ids) %>%
+    left_join(T1 %>% select(subjectid, Age), by = c("subjid" = "subjectid")) %>%
+    transmute(subject = subjid, Time = "T2", age_T1 = Age / 12,
+              sex = ifelse(Sex == 1, "Male", "Female"), income = family_income_T1,
+              standard = standard_mean_1_2s, noise = noise_mean_1_2s, laughter = laughter_mean_1_2s)) %>%
+  pivot_longer(c(standard, noise, laughter), names_to = "condition", values_to = "y") %>%
+  mutate(subject = factor(subject), Time = factor(Time, levels = c("T1", "T2")),
+         condition = factor(condition, levels = c("standard", "noise", "laughter")),
+         sex = factor(sex), age_T1 = age_T1 - mean(age_T1, na.rm = TRUE))
+longL <- bind_rows(
+  T1 %>% filter(subjectid %in% long_ids) %>%
+    transmute(subject = subjectid, Time = "T1", age_T1 = Age / 12,
+              sex = ifelse(Sex == 1, "Male", "Female"), income = family_income,
+              noise = noise_peak_latency_T1, laughter = laughter_peak_latency_T1),
+  # T2 只用 first block；基线 age 从 T1 按 ID 回填
+  T2_first %>% filter(subjid %in% long_ids) %>%
+    left_join(T1 %>% select(subjectid, Age), by = c("subjid" = "subjectid")) %>%
+    transmute(subject = subjid, Time = "T2", age_T1 = Age / 12,
+              sex = ifelse(Sex == 1, "Male", "Female"), income = family_income_T1,
+              noise = noise_peak_latency, laughter = laughter_peak_latency)) %>%
+  pivot_longer(c(noise, laughter), names_to = "condition", values_to = "y") %>%
+  mutate(subject = factor(subject), Time = factor(Time, levels = c("T1", "T2")),
+         condition = factor(condition, levels = c("noise", "laughter")),
+         sex = factor(sex), age_T1 = age_T1 - mean(age_T1, na.rm = TRUE))
+fitLongP <- lmer(y ~ Time * condition + age_T1 + sex + income + (1 | subject), data = longP)
+fitLongL <- lmer(y ~ Time * condition + age_T1 + sex + income + (1 | subject), data = longL)
+print(anova(fitLongP, type = 3)); print(anova(fitLongL, type = 3))
+```
+
+## 7.1 Longitudinal plots
+
+```{r long_plots, fig.show='hold', out.width='49%'}
+# 目的：纵向柱图 A(amplitude, ylim 0-0.3)/B(latency, ylim 1.4-1.9)。
+summ_longP <- longP %>% group_by(Time, condition) %>%
+  summarise(M = mean(y, na.rm = TRUE),
+            SE = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+summ_longL <- longL %>% group_by(Time, condition) %>%
+  summarise(M = mean(y, na.rm = TRUE),
+            SE = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+p_longP <- ggplot(summ_longP, aes(condition, M, fill = Time)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = M - SE, ymax = M + SE),
+                position = position_dodge(0.8), width = 0.2) +
+  scale_fill_manual(values = col_time) + scale_x_discrete(labels = lab_cond) +
+  coord_cartesian(ylim = c(0, 0.3)) +
+  labs(x = NULL, y = "Mean PDR amplitude (mm)", title = "A") + theme_classic(base_size = 12)
+p_longL <- ggplot(summ_longL, aes(condition, M, fill = Time)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = M - SE, ymax = M + SE),
+                position = position_dodge(0.8), width = 0.2) +
+  scale_fill_manual(values = col_time) +
+  coord_cartesian(ylim = c(1.4, 1.9)) +
+  labs(x = NULL, y = "Peak latency (s)", title = "B") + theme_classic(base_size = 12)
+print(p_longP); print(p_longL)
+```
+
+# 8 Cross-sectional comparison (T2 vs Adult)
+
+```{r cross}
+# 目的：横断 T2both vs Adult：y ~ Group*condition + sex + (1|subject)。输出 anova。
+crossP <- bind_rows(
+  T2b %>% transmute(subject = subjectid, Group = "Child_T2",
+    sex = ifelse(Sex == 1, "Male", "Female"),
+    standard = standard_mean_T2, noise = noise_mean_T2, laughter = laughter_mean_T2),
+  AD %>% transmute(subject = SubjectID, Group = "Adult",
+    sex = ifelse(sex_img == "男", "Male", "Female"),
+    standard = standard_mean_1_2s, noise = noise_mean_1_2s, laughter = laughter_mean_1_2s)) %>%
+  pivot_longer(c(standard, noise, laughter), names_to = "condition", values_to = "y") %>%
+  mutate(subject = factor(subject), Group = factor(Group, levels = c("Child_T2", "Adult")),
+         condition = factor(condition, levels = c("standard", "noise", "laughter")), sex = factor(sex))
+crossL <- bind_rows(
+  T2b %>% transmute(subject = subjectid, Group = "Child_T2",
+    sex = ifelse(Sex == 1, "Male", "Female"),
+    noise = noise_peak_latency_T2, laughter = laughter_peak_latency_T2),
+  AD %>% transmute(subject = SubjectID, Group = "Adult",
+    sex = ifelse(sex_img == "男", "Male", "Female"),
+    noise = noise_latency, laughter = laughter_latency)) %>%
+  pivot_longer(c(noise, laughter), names_to = "condition", values_to = "y") %>%
+  mutate(subject = factor(subject), Group = factor(Group, levels = c("Child_T2", "Adult")),
+         condition = factor(condition, levels = c("noise", "laughter")), sex = factor(sex))
+fitCrossP <- lmer(y ~ Group * condition + sex + (1 | subject), data = crossP)
+fitCrossL <- lmer(y ~ Group * condition + sex + (1 | subject), data = crossL)
+print(anova(fitCrossP, type = 3)); print(anova(fitCrossL, type = 3))
+```
+
+## 8.1 Cross-sectional plots
+
+```{r cross_plots, fig.show='hold', out.width='49%'}
+# 目的：横断柱图 A/B。输入 crossP/crossL；输出 p_crossP/p_crossL。
+summ_crossP <- crossP %>% group_by(Group, condition) %>%
+  summarise(M = mean(y, na.rm = TRUE),
+            SE = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+summ_crossL <- crossL %>% group_by(Group, condition) %>%
+  summarise(M = mean(y, na.rm = TRUE),
+            SE = sd(y, na.rm = TRUE) / sqrt(sum(!is.na(y))), .groups = "drop")
+p_crossP <- ggplot(summ_crossP, aes(condition, M, fill = Group)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = M - SE, ymax = M + SE),
+                position = position_dodge(0.8), width = 0.2) +
+  scale_fill_manual(values = c(Child_T2 = "#D4882A", Adult = "#7D3C98")) +
+  scale_x_discrete(labels = lab_cond) + coord_cartesian(ylim = c(0, 0.25)) +
+  labs(x = NULL, y = "Mean PDR amplitude (mm)", title = "A") + theme_classic(base_size = 12)
+p_crossL <- ggplot(summ_crossL, aes(condition, M, fill = Group)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = M - SE, ymax = M + SE),
+                position = position_dodge(0.8), width = 0.2) +
+  scale_fill_manual(values = c(Child_T2 = "#D4882A", Adult = "#7D3C98")) +
+  coord_cartesian(ylim = c(1.4, 1.9)) +
+  labs(x = NULL, y = "Peak latency (s)", title = "B") + theme_classic(base_size = 12)
+print(p_crossP); print(p_crossL)
+```
+
+## Figure 1 combined (A-F)
+
+```{r figure1_combined, fig.width=15, fig.height=9, out.width='100%'}
+# 目的：按文章顺序拼 Figure 1：A,B,C 时程 | D amplitude | E trend | F latency。
+figure1 <- cowplot::plot_grid(pA, pB, pC, p_amp, p_trend, p_lat,
+  ncol = 3, labels = LETTERS[1:6], align = "hv", label_size = 15)
+print(figure1)
+```
+
+# 9 Session info
+
+```{r session
+# 目的：记录包版本，保证可重复。
+sessionInfo()
+```
